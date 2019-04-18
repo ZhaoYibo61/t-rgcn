@@ -18,7 +18,7 @@ from dgl.contrib.data import load_data
 import dgl.function as fn
 from functools import partial
 
-from layers import RGCNBasisLayer as RGCNLayer
+from layers import RGCNBasisLayer,RGCNBasisEmbeddingLayer, RGCNBasisAttentionLayer, RGCNTuckerLayer
 from model import BaseRGCN
 
 class EntityClassify(BaseRGCN):
@@ -29,16 +29,76 @@ class EntityClassify(BaseRGCN):
         return features
 
     def build_input_layer(self):
-        return RGCNLayer(self.num_nodes, self.h_dim, self.num_rels, self.num_bases,
+        return RGCNBasisLayer(self.num_nodes, self.h_dim, self.num_rels, self.num_bases,
                          activation=F.relu, is_input_layer=True)
 
     def build_hidden_layer(self, idx):
-        return RGCNLayer(self.h_dim, self.h_dim, self.num_rels, self.num_bases,
+        return RGCNBasisLayer(self.h_dim, self.h_dim, self.num_rels, self.num_bases,
                          activation=F.relu)
 
     def build_output_layer(self):
-        return RGCNLayer(self.h_dim, self.out_dim, self.num_rels,self.num_bases,
+        return RGCNBasisLayer(self.h_dim, self.out_dim, self.num_rels,self.num_bases,
                          activation=partial(F.softmax, dim=1))
+
+
+class EntityClassifyAttention(BaseRGCN):
+    def create_features(self):
+        features = torch.arange(self.num_nodes)
+        if self.use_cuda:
+            features = features.cuda()
+        return features
+
+    def build_input_layer(self):
+        return RGCNBasisAttentionLayer(self.num_nodes, self.h_dim, self.num_rels, self.num_bases,
+                         activation=F.relu, is_input_layer=True)
+
+    def build_hidden_layer(self, idx):
+        return RGCNBasisAttentionLayer(self.h_dim, self.h_dim, self.num_rels, self.num_bases,
+                         activation=F.relu)
+
+    def build_output_layer(self):
+        return RGCNBasisAttentionLayer(self.h_dim, self.out_dim, self.num_rels,self.num_bases,
+                         activation=partial(F.softmax, dim=1))
+
+class EntityClassifyTucker(BaseRGCN):
+    def create_features(self):
+        features = torch.arange(self.num_nodes)
+        if self.use_cuda:
+            features = features.cuda()
+        return features
+
+    def build_input_layer(self):
+        return RGCNTuckerLayer(self.num_nodes, self.h_dim, self.num_rels, self.num_bases,
+                         activation=F.relu, is_input_layer=True, core_t=self.core_t)
+
+    def build_hidden_layer(self, idx):
+        return RGCNTuckerLayer(self.h_dim, self.h_dim, self.num_rels, self.num_bases,
+                         activation=F.relu, core_t=self.core_t)
+
+    def build_output_layer(self):
+        return RGCNTuckerLayer(self.h_dim, self.out_dim, self.num_rels,self.num_bases,
+                         activation=partial(F.softmax, dim=1), core_t=self.core_t)
+
+class EntityClassifyEmbedding(BaseRGCN):
+    def create_features(self):
+        features = torch.arange(self.num_nodes)
+        if self.use_cuda:
+            features = features.cuda()
+        return features
+
+    def build_input_layer(self):
+        return RGCNBasisEmbeddingLayer(self.num_nodes, self.h_dim, self.num_rels, self.num_bases,
+                         activation=F.relu, is_input_layer=True)
+
+    def build_hidden_layer(self, idx):
+        return RGCNBasisEmbeddingLayer(self.h_dim, self.h_dim, self.num_rels, self.num_bases,
+                         activation=F.relu)
+
+    def build_output_layer(self):
+        return RGCNBasisEmbeddingLayer(self.h_dim, self.out_dim, self.num_rels,self.num_bases,
+                         activation=partial(F.softmax, dim=1))
+
+
 
 def main(args):
     # load graph data
@@ -77,7 +137,39 @@ def main(args):
     g.edata.update({'type': edge_type, 'norm': edge_norm})
 
     # create model
-    model = EntityClassify(len(g),
+    if args.attention:
+        print("Using Attention")
+        model = EntityClassifyAttention(len(g),
+                           args.n_hidden,
+                           num_classes,
+                           num_rels,
+                           num_bases=args.n_bases,
+                           num_hidden_layers=args.n_layers - 2,
+                           dropout=args.dropout,
+                           use_cuda=use_cuda)
+    elif args.tucker:
+        print("Using Tucker decomposition")
+        model = EntityClassifyTucker(len(g),
+                           args.n_hidden,
+                           num_classes,
+                           num_rels,
+                           num_bases=args.n_bases,
+                           core_t=args.core_t,
+                           num_hidden_layers=args.n_layers - 2,
+                           dropout=args.dropout,
+                           use_cuda=use_cuda)
+    elif args.embedding:
+        print("Using Node Embedding Lookup")
+        model = EntityClassifyEmbedding(len(g),
+                           args.n_hidden,
+                           num_classes,
+                           num_rels,
+                           num_bases=args.n_bases,
+                           num_hidden_layers=args.n_layers - 2,
+                           dropout=args.dropout,
+                           use_cuda=use_cuda) 
+    else:
+        model = EntityClassify(len(g),
                            args.n_hidden,
                            num_classes,
                            num_rels,
@@ -89,6 +181,16 @@ def main(args):
     if use_cuda:
         model.cuda()
 
+    # print number of params
+    def count_parameters(model):
+        return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+    def print_parameters(model):
+        for n,p in model.named_parameters():
+            print(n,p.numel())
+    
+    gparams = count_parameters(model)
+    print("Params : ", gparams)
     # optimizer
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.l2norm)
 
@@ -151,6 +253,14 @@ if __name__ == '__main__':
             help="l2 norm coef")
     parser.add_argument("--relabel", default=False, action='store_true',
             help="remove untouched nodes and relabel")
+    parser.add_argument("-a","--attention", default=False, action='store_true',
+            help="add attention") 
+    parser.add_argument("-t","--tucker", default=False, action='store_true',
+            help="use tucker decomp")  
+    parser.add_argument("-c", "--core-t", type=int, default=5,
+            help="core tensor representation") 
+    parser.add_argument("-em","--embedding", default=False, action='store_true',
+            help="use embedding")   
     fp = parser.add_mutually_exclusive_group(required=False)
     fp.add_argument('--validation', dest='validation', action='store_true')
     fp.add_argument('--testing', dest='validation', action='store_false')
