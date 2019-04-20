@@ -16,10 +16,15 @@ import torch.nn.functional as F
 import random
 from dgl.contrib.data import load_data
 
-from layers import RGCNBlockLayer as RGCNLayer
+#from layers import RGCNBlockLayer as RGCNLayer
+from layers import RGCNBasisAttentionLayer as RGCNLayer
 from model import BaseRGCN
 
 import utils
+import tensorly as tl
+tl.set_backend('pytorch')
+from tensorly.tucker_tensor import tucker_to_tensor
+import pdb
 
 class EmbeddingLayer(nn.Module):
     def __init__(self, num_nodes, h_dim):
@@ -41,14 +46,26 @@ class RGCN(BaseRGCN):
 
 class LinkPredict(nn.Module):
     def __init__(self, in_dim, h_dim, num_rels, num_bases=-1,
-                 num_hidden_layers=1, dropout=0, use_cuda=False, reg_param=0):
+                 num_hidden_layers=1, dropout=0, use_cuda=False, reg_param=0, tucker=False, tucker_core=0):
         super(LinkPredict, self).__init__()
         self.rgcn = RGCN(in_dim, h_dim, h_dim, num_rels * 2, num_bases,
                          num_hidden_layers, dropout, use_cuda)
         self.reg_param = reg_param
         self.w_relation = nn.Parameter(torch.Tensor(num_rels, h_dim))
+        self.h_dim = h_dim
+        self.tucker = tucker
         nn.init.xavier_uniform_(self.w_relation,
                                 gain=nn.init.calculate_gain('relu'))
+        if tucker:
+            self.tucker_core = tucker_core
+            self.core_t = nn.Parameter(torch.Tensor(tucker_core, tucker_core, tucker_core))
+            self.s_mat = nn.Parameter(torch.Tensor(h_dim, tucker_core))
+            self.r_mat = nn.Parameter(torch.Tensor(h_dim, tucker_core))
+            self.o_mat = nn.Parameter(torch.Tensor(h_dim, tucker_core))
+            nn.init.xavier_normal_(self.core_t, gain=nn.init.calculate_gain('sigmoid'))
+            nn.init.xavier_normal_(self.s_mat, gain=nn.init.calculate_gain('sigmoid'))
+            nn.init.xavier_normal_(self.r_mat, gain=nn.init.calculate_gain('sigmoid'))
+            nn.init.xavier_normal_(self.o_mat, gain=nn.init.calculate_gain('sigmoid'))
 
     def calc_score(self, embedding, triplets):
         # DistMult
@@ -56,6 +73,27 @@ class LinkPredict(nn.Module):
         r = self.w_relation[triplets[:,1]]
         o = embedding[triplets[:,2]]
         score = torch.sum(s * r * o, dim=1)
+        return score
+
+    def calc_tucker_score(self, embedding, triplets):
+        # TucKER
+        s = embedding[triplets[:,0]] # b x h_dim
+        r = self.w_relation[triplets[:,1]]
+        o = embedding[triplets[:,2]]
+        b_size = s.size(0)
+        #core_t = tucker_to_tensor(self.core_t, [self.s_mat, self.r_mat, self.o_mat])
+        core_t = self.core_t.unsqueeze(0).expand(b_size,self.tucker_core,self.tucker_core,self.tucker_core).contiguous()
+        s_mat = self.s_mat.unsqueeze(0).expand(b_size, self.h_dim, self.tucker_core)
+        r_mat = self.r_mat.unsqueeze(0).expand(b_size, self.h_dim, self.tucker_core)
+        o_mat = self.o_mat.unsqueeze(0).expand(b_size, self.h_dim, self.tucker_core)
+        x_ = F.dropout(torch.bmm(s_mat, core_t.view(b_size, self.tucker_core, -1)), p=0.2) # b x h_dim x (t x t)
+        x_ = F.dropout(torch.bmm(s.unsqueeze(1), x_), p=0.2) # b x 1 x (t x t)
+        x_ = x_.squeeze(1).view(b_size, self.tucker_core, self.tucker_core)
+        x_ = F.dropout(torch.bmm(r_mat, x_),p=0.2) # b x h_dim x t
+        x_ = F.dropout(torch.bmm(r.unsqueeze(1), x_),p=0.2) # b x 1 x t
+        x_ = F.dropout(torch.bmm(o_mat, x_.squeeze(1).unsqueeze(2)), p=0.2) # b x h_dim x 1
+        score = torch.sigmoid(torch.bmm(o.unsqueeze(1), x_).squeeze())
+        # score = torch.sum(s * r * o, dim=1)
         return score
 
     def forward(self, g):
@@ -73,7 +111,11 @@ class LinkPredict(nn.Module):
         # triplets is a list of data samples (positive and negative)
         # each row in the triplets is a 3-tuple of (source, relation, destination)
         embedding = self.forward(g)
-        score = self.calc_score(embedding, triplets)
+        # choose either DistMult or Tucker
+        if self.tucker:
+            score = self.calc_tucker_score(embedding, triplets)
+        else:
+            score = self.calc_score(embedding, triplets)
         predict_loss = F.binary_cross_entropy_with_logits(score, labels)
         reg_loss = self.regularization_loss(embedding)
         return predict_loss + self.reg_param * reg_loss
@@ -101,7 +143,9 @@ def main(args):
                         num_hidden_layers=args.n_layers,
                         dropout=args.dropout,
                         use_cuda=use_cuda,
-                        reg_param=args.regularization)
+                        reg_param=args.regularization,
+                        tucker=args.tucker,
+                        tucker_core=args.tucker_core)
 
     # validation and testing triplets
     valid_data = torch.LongTensor(valid_data)
@@ -243,6 +287,10 @@ if __name__ == '__main__':
             help="number of negative samples per positive sample")
     parser.add_argument("--evaluate-every", type=int, default=500,
             help="perform evaluation every n epochs")
+    parser.add_argument("--tucker", action='store_true', default=False,
+                        help="Use tucker decomposition in score calculation")
+    parser.add_argument("--tucker_core", type=int, default=2,
+                        help="core tensor dim")
 
     args = parser.parse_args()
     print(args)

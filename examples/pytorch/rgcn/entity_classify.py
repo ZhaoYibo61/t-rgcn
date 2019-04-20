@@ -20,6 +20,7 @@ from functools import partial
 
 from layers import RGCNBasisLayer,RGCNBasisEmbeddingLayer, RGCNBasisAttentionLayer, RGCNTuckerLayer
 from model import BaseRGCN
+import matplotlib.pyplot as plt
 
 class EntityClassify(BaseRGCN):
     def create_features(self):
@@ -69,15 +70,15 @@ class EntityClassifyTucker(BaseRGCN):
 
     def build_input_layer(self):
         return RGCNTuckerLayer(self.num_nodes, self.h_dim, self.num_rels, self.num_bases,
-                         activation=F.relu, is_input_layer=True, core_t=self.core_t)
+                         activation=F.relu, is_input_layer=True,rank=self.core_t, input_dropout=args.tucker_dropout)
 
     def build_hidden_layer(self, idx):
         return RGCNTuckerLayer(self.h_dim, self.h_dim, self.num_rels, self.num_bases,
-                         activation=F.relu, core_t=self.core_t)
+                         activation=F.relu, rank=self.core_t, input_dropout=args.tucker_dropout)
 
     def build_output_layer(self):
         return RGCNTuckerLayer(self.h_dim, self.out_dim, self.num_rels,self.num_bases,
-                         activation=partial(F.softmax, dim=1), core_t=self.core_t)
+                         activation=partial(F.softmax, dim=1), rank=self.core_t, input_dropout=args.tucker_dropout)
 
 class EntityClassifyEmbedding(BaseRGCN):
     def create_features(self):
@@ -99,6 +100,33 @@ class EntityClassifyEmbedding(BaseRGCN):
                          activation=partial(F.softmax, dim=1))
 
 
+def plot_grad_flow(named_parameters):
+    '''Plots the gradients flowing through different layers in the net during training.
+    Can be used for checking for possible gradient vanishing / exploding problems.
+
+    Usage: Plug this function in Trainer class after loss.backwards() as
+    "plot_grad_flow(self.model.named_parameters())" to visualize the gradient flow'''
+    ave_grads = []
+    max_grads = []
+    layers = []
+    for n, p in named_parameters:
+        print(n)
+        if (p.requires_grad) and ("bias" not in n):
+            layers.append(n)
+            ave_grads.append(p.grad.abs().mean())
+            max_grads.append(p.grad.abs().max())
+    print(ave_grads)
+    print(max_grads)
+    plt.bar(np.arange(len(max_grads)), max_grads, alpha=0.1, lw=1, color="c")
+    plt.bar(np.arange(len(max_grads)), ave_grads, alpha=0.1, lw=1, color="b")
+    plt.hlines(0, 0, len(ave_grads) + 1, lw=2, color="k")
+    plt.xticks(range(0, len(ave_grads), 1), layers, rotation="vertical")
+    plt.xlim(left=0, right=len(ave_grads))
+    plt.ylim(bottom=-0.001, top=0.02)  # zoom in on the lower gradient regions
+    plt.xlabel("Layers")
+    plt.ylabel("average gradient")
+    plt.title("Gradient flow")
+    plt.savefig('rgcn_grads.png')
 
 def main(args):
     # load graph data
@@ -129,6 +157,9 @@ def main(args):
         edge_type = edge_type.cuda()
         edge_norm = edge_norm.cuda()
         labels = labels.cuda()
+        device = 'cuda'
+    else:
+        device = 'cpu'
 
     # create graph
     g = DGLGraph()
@@ -192,6 +223,9 @@ def main(args):
     gparams = count_parameters(model)
     print("Params : ", gparams)
     # optimizer
+    # import pdb; pdb.set_trace()
+    for name, par in model.named_parameters():
+        print(name, par.shape)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=args.l2norm)
 
     # training loop
@@ -204,8 +238,21 @@ def main(args):
         t0 = time.time()
         logits = model.forward(g)
         loss = F.cross_entropy(logits[train_idx], labels[train_idx])
+        if args.tucker and args.orthogonal_reg:
+            # apply orthogonal regularixation to the factor matrices
+            reg = 1e-6
+            orth_loss = torch.empty((1), requires_grad=True, device=device, dtype=torch.float32)
+            for name, param in model.named_parameters():
+                if 'factor' in name:
+                    param_flat = param.view(param.shape[0], -1)
+                    sym = torch.mm(param_flat, torch.t(param_flat))
+                    sym -= torch.eye(param_flat.shape[0], device=device)
+                    orth_loss = orth_loss + (reg * sym.sum())
+            loss += orth_loss.item()
         t1 = time.time()
         loss.backward()
+        #import pdb; pdb.set_trace()
+        #plot_grad_flow(model.named_parameters())
         optimizer.step()
         t2 = time.time()
 
@@ -224,7 +271,7 @@ def main(args):
     logits = model.forward(g)
     test_loss = F.cross_entropy(logits[test_idx], labels[test_idx])
     test_acc = torch.sum(logits[test_idx].argmax(dim=1) == labels[test_idx]).item() / len(test_idx)
-    print("Test Accuracy: {:.4f} | Test loss: {:.4f}".format(test_acc, test_loss.item()))
+    print("[togrep] | Run: {} | Test Accuracy: {:.4f} | Test loss: {:.4f} | Params: {}".format(args.run, test_acc, test_loss.item(), gparams))
     print()
 
     print("Mean forward time: {:4f}".format(np.mean(forward_time[len(forward_time) // 4:])))
@@ -256,11 +303,17 @@ if __name__ == '__main__':
     parser.add_argument("-a","--attention", default=False, action='store_true',
             help="add attention") 
     parser.add_argument("-t","--tucker", default=False, action='store_true',
-            help="use tucker decomp")  
+            help="use tucker decomp")
+    parser.add_argument("--tucker_dropout", type=float, default=0.2,
+                        help="tucker weight dropout probability")
+    parser.add_argument("--orthogonal_reg", action='store_true',
+                        help="apply orthogonal regularization to factor matrices")
     parser.add_argument("-c", "--core-t", type=int, default=5,
             help="core tensor representation") 
     parser.add_argument("-em","--embedding", default=False, action='store_true',
-            help="use embedding")   
+            help="use embedding")
+    parser.add_argument("-r", "--run", type=int, default=0,
+                        help="run number")
     fp = parser.add_mutually_exclusive_group(required=False)
     fp.add_argument('--validation', dest='validation', action='store_true')
     fp.add_argument('--testing', dest='validation', action='store_false')
