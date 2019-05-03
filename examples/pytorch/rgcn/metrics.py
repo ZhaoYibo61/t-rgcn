@@ -18,6 +18,13 @@ def get_mean_std(filename):
                 accs.append(acc)
     return np.mean(accs), np.std(accs)
 
+def get_params(filename):
+    with open(filename) as fp:
+        for line in fp:
+            if 'Params' in line:
+                params = line.split(' : ')[-1]
+                return params
+
 def print_mean_std(filenames):
     files = glob.glob(filenames)
     for filename in files:

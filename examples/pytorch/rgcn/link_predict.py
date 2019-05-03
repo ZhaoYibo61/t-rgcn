@@ -17,7 +17,7 @@ import random
 from dgl.contrib.data import load_data
 
 #from layers import RGCNBlockLayer as RGCNLayer
-from layers import RGCNBasisAttentionLayer as RGCNLayer
+from layers import RGCNTuckerLayer as RGCNLayer
 from model import BaseRGCN
 
 import utils
@@ -42,7 +42,7 @@ class RGCN(BaseRGCN):
     def build_hidden_layer(self, idx):
         act = F.relu if idx < self.num_hidden_layers - 1 else None
         return RGCNLayer(self.h_dim, self.h_dim, self.num_rels, self.num_bases,
-                         activation=act, self_loop=True, dropout=self.dropout)
+                         activation=act, rank=2)
 
 class LinkPredict(nn.Module):
     def __init__(self, in_dim, h_dim, num_rels, num_bases=-1,

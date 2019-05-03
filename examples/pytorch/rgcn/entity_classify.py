@@ -18,9 +18,11 @@ from dgl.contrib.data import load_data
 import dgl.function as fn
 from functools import partial
 
-from layers import RGCNBasisLayer,RGCNBasisEmbeddingLayer, RGCNBasisAttentionLayer, RGCNTuckerLayer
+from layers import RGCNBasisLayer,RGCNBasisEmbeddingLayer, RGCNBasisAttentionLayer
+from layers import RGCNTorchTuckerLayer as RGCNTuckerLayer
 from model import BaseRGCN
 import matplotlib.pyplot as plt
+import pickle as pkl
 
 class EntityClassify(BaseRGCN):
     def create_features(self):
@@ -61,6 +63,10 @@ class EntityClassifyAttention(BaseRGCN):
         return RGCNBasisAttentionLayer(self.h_dim, self.out_dim, self.num_rels,self.num_bases,
                          activation=partial(F.softmax, dim=1))
 
+
+def parse_ranks(s):
+    return [int(x) for x in s.split(',')]
+
 class EntityClassifyTucker(BaseRGCN):
     def create_features(self):
         features = torch.arange(self.num_nodes)
@@ -69,16 +75,58 @@ class EntityClassifyTucker(BaseRGCN):
         return features
 
     def build_input_layer(self):
-        return RGCNTuckerLayer(self.num_nodes, self.h_dim, self.num_rels, self.num_bases,
-                         activation=F.relu, is_input_layer=True,rank=self.core_t, input_dropout=args.tucker_dropout)
+        layer = RGCNTuckerLayer(self.num_nodes, self.h_dim, self.num_rels, self.num_bases,
+                         activation=F.relu, is_input_layer=True,ranks=parse_ranks(self.core_t), input_dropout=args.tucker_dropout,
+                               rank_per=args.rank_per, decomp=args.decomp)
+        if args.weight_norm:
+            print("Applying weight norm")
+            layer = torch.nn.utils.weight_norm(layer, dim=None, name='tucker_core_0')
+            layer = torch.nn.utils.weight_norm(layer, dim=None, name='tucker_core_1')
+            layer = torch.nn.utils.weight_norm(layer, dim=None, name='tucker_core_2')
+            layer = torch.nn.utils.weight_norm(layer, dim=None, name='tucker_Us_0')
+            layer = torch.nn.utils.weight_norm(layer, dim=None, name='tucker_Us_1')
+            layer = torch.nn.utils.weight_norm(layer, dim=None, name='tucker_Us_2')
+        return layer
 
     def build_hidden_layer(self, idx):
-        return RGCNTuckerLayer(self.h_dim, self.h_dim, self.num_rels, self.num_bases,
-                         activation=F.relu, rank=self.core_t, input_dropout=args.tucker_dropout)
+        layer = RGCNTuckerLayer(self.h_dim, self.h_dim, self.num_rels, self.num_bases,
+                       activation=F.relu, ranks=parse_ranks(self.core_t), input_dropout=args.tucker_dropout,
+                               rank_per=args.rank_per, decomp=args.decomp)
+
+        if args.weight_norm:
+            print("Applying weight norm")
+            layer = torch.nn.utils.weight_norm(layer, dim=None, name='tucker_core_0')
+            layer = torch.nn.utils.weight_norm(layer, dim=None, name='tucker_core_1')
+            layer = torch.nn.utils.weight_norm(layer, dim=None, name='tucker_core_2')
+            layer = torch.nn.utils.weight_norm(layer, dim=None, name='tucker_Us_0')
+            layer = torch.nn.utils.weight_norm(layer, dim=None, name='tucker_Us_1')
+            layer = torch.nn.utils.weight_norm(layer, dim=None, name='tucker_Us_2')
+        return layer
 
     def build_output_layer(self):
-        return RGCNTuckerLayer(self.h_dim, self.out_dim, self.num_rels,self.num_bases,
-                         activation=partial(F.softmax, dim=1), rank=self.core_t, input_dropout=args.tucker_dropout)
+
+        ranks = parse_ranks(self.core_t)
+        ranks[1] = -1
+        ranks[2] = -1
+        layer = RGCNTuckerLayer(self.h_dim, self.out_dim, self.num_rels,self.num_bases,
+                         activation=partial(F.softmax, dim=1), ranks=ranks, input_dropout=args.tucker_dropout,
+                               rank_per=args.rank_per, decomp=args.decomp)
+        if args.weight_norm:
+            print("Applying weight norm")
+            layer = torch.nn.utils.weight_norm(layer, dim=None, name='tucker_core_0')
+            layer = torch.nn.utils.weight_norm(layer, dim=None, name='tucker_core_1')
+            layer = torch.nn.utils.weight_norm(layer, dim=None, name='tucker_core_2')
+            layer = torch.nn.utils.weight_norm(layer, dim=None, name='tucker_Us_0')
+            layer = torch.nn.utils.weight_norm(layer, dim=None, name='tucker_Us_1')
+            layer = torch.nn.utils.weight_norm(layer, dim=None, name='tucker_Us_2')
+        return layer
+
+    def forward(self, g):
+        if self.features is not None:
+            g.ndata['id'] = self.features
+        for layer in self.layers:
+            layer(g)
+        return g.ndata.pop('h')
 
 class EntityClassifyEmbedding(BaseRGCN):
     def create_features(self):
@@ -232,23 +280,38 @@ def main(args):
     print("start training...")
     forward_time = []
     backward_time = []
+    if args.tucker:
+        norms = {}
     model.train()
+    last_val_acc = 0
+    patience = 0
     for epoch in range(args.n_epochs):
         optimizer.zero_grad()
         t0 = time.time()
         logits = model.forward(g)
         loss = F.cross_entropy(logits[train_idx], labels[train_idx])
-        if args.tucker and args.orthogonal_reg:
-            # apply orthogonal regularixation to the factor matrices
-            reg = 1e-6
-            orth_loss = torch.empty((1), requires_grad=True, device=device, dtype=torch.float32)
+        if args.tucker:
+            f_ns = []
             for name, param in model.named_parameters():
-                if 'factor' in name:
-                    param_flat = param.view(param.shape[0], -1)
-                    sym = torch.mm(param_flat, torch.t(param_flat))
-                    sym -= torch.eye(param_flat.shape[0], device=device)
-                    orth_loss = orth_loss + (reg * sym.sum())
-            loss += orth_loss.item()
+                if 'core' in name:
+                    if name not in norms:
+                        norms[name] = []
+                    norms[name].append(torch.norm(param).item())
+                if 'Us' in name:
+                    if name not in norms:
+                        norms[name] = []
+                    norms[name].append(torch.norm(param).item())
+            if args.orthogonal_reg:
+                # apply orthogonal regularixation to the factor matrices
+                reg = 1e-6
+                orth_loss = torch.empty((1), requires_grad=True, device=device, dtype=torch.float32)
+                for name, param in model.named_parameters():
+                    if 'Us' in name:
+                        param_flat = param.view(param.shape[0], -1)
+                        sym = torch.mm(param_flat, torch.t(param_flat))
+                        sym -= torch.eye(param_flat.shape[0], device=device)
+                        orth_loss = orth_loss + (reg * sym.sum())
+                loss += orth_loss.item()
         t1 = time.time()
         loss.backward()
         #import pdb; pdb.set_trace()
@@ -263,8 +326,16 @@ def main(args):
         train_acc = torch.sum(logits[train_idx].argmax(dim=1) == labels[train_idx]).item() / len(train_idx)
         val_loss = F.cross_entropy(logits[val_idx], labels[val_idx])
         val_acc = torch.sum(logits[val_idx].argmax(dim=1) == labels[val_idx]).item() / len(val_idx)
+        if last_val_acc < val_acc:
+            last_val_acc = val_acc
+            patience = 0
+        else:
+            patience += 1
         print("Train Accuracy: {:.4f} | Train Loss: {:.4f} | Validation Accuracy: {:.4f} | Validation loss: {:.4f}".
               format(train_acc, loss.item(), val_acc, val_loss.item()))
+        if patience > args.patience:
+            print("Exceedeed patience, breaking...")
+            break
     print()
 
     model.eval()
@@ -276,6 +347,17 @@ def main(args):
 
     print("Mean forward time: {:4f}".format(np.mean(forward_time[len(forward_time) // 4:])))
     print("Mean backward time: {:4f}".format(np.mean(backward_time[len(backward_time) // 4:])))
+    #import pdb; pdb.set_trace()
+    predicted_labels = logits[test_idx].argmax(dim=1).cpu().numpy()
+    gold_labels = labels[test_idx].cpu().numpy()
+    indexes = test_idx
+    predictions = {'index': test_idx, 'gold_labels': gold_labels,
+                   'predicted_labels': predicted_labels, 'indexes': indexes}
+    #pkl.dump(predictions, open('rgcn_{}_run_{}_predictions.pkl'.format(args.dataset, args.run),'wb'))
+    # dump
+    if args.tucker:
+        pkl.dump(norms, open('tucker_{}_run_{}_norms.pkl'.format(
+            args.dataset, args.run),'wb'))
 
 
 if __name__ == '__main__':
@@ -306,14 +388,21 @@ if __name__ == '__main__':
             help="use tucker decomp")
     parser.add_argument("--tucker_dropout", type=float, default=0.2,
                         help="tucker weight dropout probability")
+    parser.add_argument("--rank-per", type=int, default=1,
+                        help="rank of input layer")
     parser.add_argument("--orthogonal_reg", action='store_true',
                         help="apply orthogonal regularization to factor matrices")
-    parser.add_argument("-c", "--core-t", type=int, default=5,
+    parser.add_argument("-c", "--core-t", type=str, default="5,5,5",
             help="core tensor representation") 
     parser.add_argument("-em","--embedding", default=False, action='store_true',
             help="use embedding")
     parser.add_argument("-r", "--run", type=int, default=0,
                         help="run number")
+    parser.add_argument("--decomp", type=str, default='tucker', required=False,
+                        help="tucker/tt")
+    parser.add_argument("--weight_norm", action='store_true', help="add weight norm", default=False)
+    parser.add_argument("--patience", type=int, default=30,
+                        help="patience")
     fp = parser.add_mutually_exclusive_group(required=False)
     fp.add_argument('--validation', dest='validation', action='store_true')
     fp.add_argument('--testing', dest='validation', action='store_false')

@@ -3,15 +3,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 import dgl.function as fn
 import pdb
-import tensorly as tl
-tl.set_backend('pytorch')
+#import tensorly as tl
+#tl.set_backend('pytorch')
 from tensorly.decomposition import tucker
-from tensorly.random import check_random_state
+#from tensorly.random import check_random_state
 from tensorly.tucker_tensor import tucker_to_tensor
 from torch_scatter import scatter_add
+import tntorch as tn
+torch.set_default_dtype(torch.float32)
 
 random_state = 1234
-rng = check_random_state(random_state)
+#rng = check_random_state(random_state)
 
 class RGCNLayer(nn.Module):
     def __init__(self, in_feat, out_feat, bias=None, activation=None,
@@ -126,7 +128,7 @@ class RGCNBasisEmbeddingLayer(RGCNLayer):
 
         if self.is_input_layer:
             self.embed = nn.Embedding(self.in_feat, self.out_feat)
-            self.embed.weight.data.requires_grad = False
+            # self.embed.weight.data.requires_grad = False
             nn.init.xavier_normal_(self.embed.weight, gain=nn.init.calculate_gain('sigmoid'))
         else:
             # add basis weights
@@ -179,7 +181,7 @@ class RGCNBasisEmbeddingLayer(RGCNLayer):
 
 class RGCNTuckerLayer(RGCNLayer):
     def __init__(self, in_feat, out_feat, num_rels, num_bases=-1, bias=None,
-                 activation=None, is_input_layer=False, rank=3, input_dropout=0.2):
+                 activation=None, is_input_layer=False, rank=3, input_dropout=0.2, rank_per=0.1):
         super(RGCNTuckerLayer, self).__init__(in_feat, out_feat, bias, activation)
         self.in_feat = in_feat
         self.out_feat = out_feat
@@ -189,12 +191,20 @@ class RGCNTuckerLayer(RGCNLayer):
         self.num_bases = self.num_rels
         self.rank = rank
 
-        self.ranks = [self.rank, self.rank, self.rank]
+        # calculate
+
+        # if is_input_layer:
+        #     self.ranks = [self.num_bases, rank_per, self.out_feat]
+        # else:
+        #     self.ranks = [self.num_bases, self.in_feat, self.out_feat]
+
+        self.ranks = [rank, rank, rank]
+
         # add basis weights
         weight = torch.empty((self.num_bases, self.in_feat,
                                                 self.out_feat))
 
-        self.core = nn.Parameter(torch.empty((self.rank, self.rank, self.rank)))
+        self.core = nn.Parameter(torch.empty((self.ranks[0], self.ranks[1], self.ranks[2])))
         self.factor_1 = nn.Parameter(torch.empty((weight.shape[0], self.ranks[0])))
         self.factor_2 = nn.Parameter(torch.empty((weight.shape[1], self.ranks[1])))
         self.factor_3 = nn.Parameter(torch.empty((weight.shape[2], self.ranks[2])))
@@ -246,7 +256,7 @@ class RGCNTuckerLayer(RGCNLayer):
         for fi in range(3):
             f = getattr(self, "factor_{}".format(fi+1))
             cr.append(f.shape[0])
-            core = torch.matmul(f, core.view(core_rank, -1)).view(f.shape[0], cr[1], -1)
+            core = torch.matmul(f, core.view(cr[0], -1)).view(f.shape[0], cr[1], -1)
             core = core.permute(1, 2, 0).contiguous()
             cr.pop(0)
         weight = self.bnw(self.input_dropout(core))
@@ -287,6 +297,125 @@ def test_tucker_to_tensor(core, factors):
         cr.pop(0)
     return core
 
+
+class RGCNTorchTuckerLayer(RGCNLayer):
+    def __init__(self, in_feat, out_feat, num_rels, num_bases=-1, bias=None,
+                 activation=None, is_input_layer=False, ranks=None, input_dropout=0.2, rank_per=0.1, decomp='tucker'):
+        super(RGCNTorchTuckerLayer, self).__init__(in_feat, out_feat, bias, activation)
+        self.in_feat = in_feat
+        self.out_feat = out_feat
+        self.num_rels = num_rels
+        self.num_bases = num_bases
+        self.is_input_layer = is_input_layer
+        self.num_bases = self.num_rels
+
+        # calculate
+
+        # if is_input_layer:
+        #     self.ranks = [self.num_bases, rank_per, self.out_feat]
+        # else:
+        #     self.ranks = [self.num_bases, self.in_feat, self.out_feat]
+        if ranks[0] == -1:
+            ranks[0] = self.num_rels
+
+        if ranks[1] == -1:
+            ranks[1] = in_feat
+
+        if self.is_input_layer:
+            self.ranks = [ranks[0], ranks[1], self.out_feat]
+        else:
+            self.ranks = [ranks[0], self.in_feat, self.out_feat]
+        print("Ranks - {}".format(self.ranks))
+
+        # add basis weights
+        if decomp == 'tucker':
+            self.weight = tn.randn(self.num_bases, self.in_feat,
+                                  self.out_feat, ranks_tucker=self.ranks, device='cuda',
+                                   requires_grad=True)
+        elif decomp == 'tt':
+            self.weight = tn.randn(self.num_bases, self.in_feat,
+                                   self.out_feat, ranks_tt=self.ranks, device='cuda',
+                                   requires_grad=True)
+        else:
+            raise NotImplementedError("decomposition not implemented")
+
+        # self.core = nn.Parameter(torch.empty((self.ranks[0], self.ranks[1], self.ranks[2])))
+        # self.factor_1 = nn.Parameter(torch.empty((weight.shape[0], self.ranks[0])))
+        # self.factor_2 = nn.Parameter(torch.empty((weight.shape[1], self.ranks[1])))
+        # self.factor_3 = nn.Parameter(torch.empty((weight.shape[2], self.ranks[2])))
+
+        self.input_dropout = torch.nn.Dropout(input_dropout)
+        self.bnw = torch.nn.BatchNorm1d(self.in_feat)
+
+        # self.factors = nn.ParameterList([])
+        # for f_i,f in enumerate(factors):
+        #     fac = nn.Parameter(f)
+        #     # self.register_parameter('tucker_factor_{}'.format(f_i), fac)
+        #     self.factors.append(fac)
+        # # self.weight_full = nn.Parameter(self.weight.torch())
+        cores = []
+        for c_i, core in enumerate(self.weight.cores):
+            core = nn.Parameter(core)
+            #nn.init.xavier_normal_(core, gain=nn.init.calculate_gain('sigmoid'))
+            self.register_parameter('tucker_core_{}'.format(c_i), core)
+            cores.append(core)
+        self.weight.cores = cores
+
+        Us = []
+        for u_i, u in enumerate(self.weight.Us):
+            u = nn.Parameter(u)
+            #nn.init.orthogonal(u, gain=nn.init.calculate_gain('sigmoid'))
+            self.register_parameter('tucker_Us_{}'.format(u_i), u)
+            Us.append(u)
+
+        self.weight.Us = Us
+        self.model_params = nn.ParameterList(cores + Us)
+
+    # def parameters(self, recurse=True):
+    #     for c in self.weight.cores:
+    #         if c.requires_grad:
+    #             yield c
+    #     for U in self.weight.Us:
+    #         if U is not None and U.requires_grad:
+    #             yield U
+
+    def propagate(self, g):
+        # pdb.set_trace()
+        # core_rank = self.core.shape[0]
+        # cr = list(self.core.shape)
+        # core = self.core
+        # for fi in range(3):
+        #     f = getattr(self, "factor_{}".format(fi + 1))
+        #     cr.append(f.shape[0])
+        #     core = torch.matmul(f, core.view(cr[0], -1)).view(f.shape[0], cr[1], -1)
+        #     core = core.permute(1, 2, 0).contiguous()
+        #     cr.pop(0)
+        weight = self.bnw(self.input_dropout(self.weight.torch()))
+        weight = weight.to(torch.float32)
+        # no float?
+        # weight = self.weight.float()
+        # weight = tucker_to_tensor(self.core, [self.factor_1, self.factor_2, self.factor_3])
+
+        if self.is_input_layer:
+            def msg_func(edges):
+                # for input layer, matrix multiply can be converted to be
+                # an embedding lookup using source node id
+                # weight = test_tucker_to_tensor(self.core, [self.factor_1, self.factor_2, self.factor_3]).float()
+                # weight = self.weight
+                embed = weight.view(-1, self.out_feat)
+                index = edges.data['type'] * self.in_feat + edges.src['id']
+                return {'msg': embed.index_select(0, index) * edges.data['norm']}
+        else:
+            def msg_func(edges):
+                # weight = tucker_to_tensor(self.core, [self.factor_1, self.factor_2, self.factor_3]).float()
+                # weight = self.weight
+                w = weight.index_select(0, edges.data['type'])
+                msg = torch.bmm(edges.src['h'].unsqueeze(1), w).squeeze()
+                # pdb.set_trace()
+                # score = torch.sigmoid(torch.bmm(msg.unsqueeze(1), msg.unsqueeze(2)))
+                msg = msg * edges.data['norm']
+                return {'msg': msg}
+        g.update_all(msg_func, fn.sum(msg='msg', out='h'), None)
 
 
 class RGCNBasisAttentionLayer(RGCNLayer):
